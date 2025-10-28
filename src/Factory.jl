@@ -17,6 +17,7 @@ The `data` named tuple should contain the following fields:
 ### Returns
 - `MySimulatedAnnealingMinimumVariancePortfolioAllocationProblem`: The constructed model instance.
 """
+## for save purpose
 function build(modeltype::Type{MySimulatedAnnealingMinimumVariancePortfolioAllocationProblem}, 
     data::NamedTuple)::MySimulatedAnnealingMinimumVariancePortfolioAllocationProblem
 
