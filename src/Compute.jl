@@ -6,16 +6,11 @@ function _safe_log(x::Float64)
     end
 end
 
-function _objective_function(w::Array{Float64,1}, ḡ::Array{Float64,1}, 
+function _objective_function(w::Array{Float64,1}, ḡ::Array{Float64,1}, 
     Σ̂::Array{Float64,2}, R::Float64, μ::Float64, ρ::Float64)
 
-
-    # TODO: This version of the objective function includes the barrier term, and the penalty terms -
-    f = w'*(Σ̂*w) + (1/(2*ρ))*((sum(w) - 1.0)^2 + (transpose(ḡ)*w - R)^2) - (1/μ)*sum(_safe_log.(w));
-
-    # TODO: This version of the objective function does NOT have the barrier term
-    # f = w'*(Σ̂*w) + (1/(2*ρ))*((sum(w) - 1.0)^2 + (transpose(ḡ)*w - R)^2);
-
+    # Simplified version without barrier term since we enforce non-negativity directly
+    f = w'*(Σ̂*w) + (1/(2*ρ))*((sum(w) - 1.0)^2 + (transpose(ḡ)*w - R)^2);
 
     return f;
 end
@@ -46,9 +41,9 @@ The `solve` function solves the minimum variance portfolio allocation problem us
 
 """
 function solve(model::MySimulatedAnnealingMinimumVariancePortfolioAllocationProblem; 
-    verbose::Bool = true, K::Int = 10000, T₀::Float64 = 1.0, T₁::Float64 = 0.1, 
-    α::Float64 = 0.99, β::Float64 = 0.01, τ::Float64 = 0.99,
-    μ::Float64 = 1.0, ρ::Float64 = 1.0)
+    verbose::Bool = true, K::Int = 100000, T₀::Float64 = 1000.0, T₁::Float64 = 1e-8, 
+    α::Float64 = 0.99, β::Float64 = 0.02, τ::Float64 = 0.99,
+    μ::Float64 = 1000.0, ρ::Float64 = 1000.0)
 
     # initialize -
     has_converged = false;
@@ -59,44 +54,173 @@ function solve(model::MySimulatedAnnealingMinimumVariancePortfolioAllocationProb
     Σ̂ = model.Σ̂;
     R = model.R;
 
-    # initialize parameters for simulated annealing -
-    T = T₀; # initial T -
-    current_w = w;
-    current_f = _objective_function(current_w, ḡ, Σ̂, R, μ, ρ);
+    # Pre-allocate memory for matrix operations
+    Σ̂w = zeros(length(w))
     
-    # best solution found so far -
-    w_best = current_w;
+    # Initialize simulated annealing temperature
+    T = T₀; # Initial temperature controls acceptance probability of worse solutions
+    
+    # Initialize portfolio weights
+    current_w = copy(w);
+    current_w .= abs.(current_w); # Ensure non-negative weights for valid portfolio
+    
+    # Initialize tracking variables for initial solution search
+    best_init_error = Inf    # Track smallest return target error found
+    best_init_w = copy(current_w)  # Store best initial weights
+    
+    # Smart initialization: Try 1000 random portfolios to find good starting point
+    for _ in 1:1000
+        # Generate random portfolio with non-negative weights
+        tmp_w = abs.(randn(length(w)))
+        tmp_w ./= sum(tmp_w)  # Normalize to satisfy sum-to-one constraint
+        
+        # Check how well this portfolio meets target return
+        ret_error = abs(dot(ḡ, tmp_w) - R)  # Error from desired return
+        
+        # Keep track of best initialization found
+        if ret_error < best_init_error
+            best_init_error = ret_error
+            best_init_w .= tmp_w
+            
+            # Early stop if we found a very good initial solution
+            if ret_error < 0.01  # Within 1% of target return
+                break
+            end
+        end
+    end
+    
+    # Use the best initial solution found
+    current_w .= best_init_w
+    
+    # Pre-compute initial objective value with adaptive penalties
+    mul!(Σ̂w, Σ̂, current_w)
+    ret_penalty = (dot(ḡ, current_w) - R)^2
+    sum_penalty = (sum(current_w) - 1.0)^2
+    current_f = dot(current_w, Σ̂w) + (1/ρ)*(sum_penalty + 100.0*ret_penalty);
+    
+    # Best solution tracking with strict feasibility checks
+    w_best = copy(current_w);
     f_best = current_f;
+    best_ret_penalty = ret_penalty;
+    best_sum_penalty = sum_penalty;
+    
+    # Adaptive iteration control
     KL = K;
+    no_improvement_count = 0;
 
     while has_converged == false
     
         accepted_counter = 0; 
         
-        # TODO: Implement simulated annealing logic here -
-        throw(ErrorException("Oooops! Simulated annealing logic not yet implemented!!"));
+        # Simulated annealing main loop
+        for _ in 1:KL
+            # Generate a new candidate solution
+            candidate_w = copy(current_w)
+            
+            # More sophisticated perturbation strategy
+            i, j = rand(1:length(candidate_w), 2)
+            
+            # Adaptive step size based on temperature
+            δ = β * T * candidate_w[i]
+            
+            # Ensure non-negativity constraint
+            if candidate_w[i] - δ >= 0
+                candidate_w[i] -= δ
+                candidate_w[j] += δ
+                
+                # Normalize to maintain sum-to-one constraint
+                candidate_w ./= sum(candidate_w)
+            end
+            
+            # Calculate portfolio metrics and constraint violations
+            mul!(Σ̂w, Σ̂, candidate_w)  # Efficient matrix multiplication for risk calculation
+            ret_error = abs(dot(ḡ, candidate_w) - R)  # How far from target return
+            ret_penalty = ret_error^2  # Squared penalty for return constraint
+            sum_penalty = (sum(candidate_w) - 1.0)^2  # Penalty for sum-to-one constraint
+            risk_term = dot(candidate_w, Σ̂w)  # Portfolio variance (risk measure)
+            
+            # Adaptive penalty weights that increase with constraint violation
+            ret_weight = 1000.0 * (1.0 + 100.0 * (ret_error > 0.01))  # Higher penalty for >1% return error
+            temp_factor = (T₀/T)^0.5  # Increase constraint importance as we cool
+            
+            # Combined objective: risk + temperature-scaled constraint penalties
+            candidate_f = risk_term + temp_factor*(sum_penalty/ρ + ret_weight*ret_penalty)
+            
+            # Calculate change in objective function
+            Δf = candidate_f - current_f
+            
+            # Calculate base acceptance probability using Metropolis criterion
+            acceptance_prob = exp(-Δf/T)  # Standard simulated annealing acceptance
+            
+            # Increase acceptance probability for solutions closer to target return
+            if ret_error < best_ret_penalty^0.5  # If error is improving
+                acceptance_prob *= 10.0  # Make acceptance 10x more likely
+            end
+            
+            # Strongly favor solutions that satisfy all constraints
+            if ret_error < 0.01 && sum_penalty < 1e-4  # Within 1% of target & sum ≈ 1
+                acceptance_prob *= 10.0  # Further increase acceptance chance
+            end
+            
+            # Reduce probability of accepting solutions that worsen return significantly
+            if ret_error > 2.0 * best_ret_penalty^0.5  # If error more than doubles
+                acceptance_prob *= 0.1  # Make acceptance 10x less likely
+            end
+            
+            if Δf <= 0 || rand() < acceptance_prob
+                current_w = copy(candidate_w)
+                current_f = candidate_f
+                accepted_counter += 1
+                
+                # Update best solution if current is better and closer to target return
+                # Update best solution with strict feasibility checks
+                is_better_feasible = (ret_penalty < 1e-4 && sum_penalty < 1e-4 && 
+                                    (current_f < f_best || best_ret_penalty > 1e-4))
+                is_better_infeasible = (current_f < f_best && 
+                                      ret_penalty < best_ret_penalty && 
+                                      sum_penalty < best_sum_penalty)
+                
+                if is_better_feasible || (is_better_infeasible && !any(w_best .< -1e-10))
+                    w_best = copy(current_w)
+                    f_best = current_f
+                    best_ret_penalty = ret_penalty
+                    best_sum_penalty = sum_penalty
+                    no_improvement_count = 0  # Reset counter on improvement
+                else
+                    no_improvement_count += 1
+                end
+            end
+        end
 
         # update KL -
         fraction_accepted = accepted_counter/KL; # what is the fraction of accepted moves
         
-        # Case 1: we are accepting alot, so decrease the number of iterations
+        # Adaptively adjust iteration count based on acceptance rate
         if (fraction_accepted > 0.8)
-            KL = ceil(Int, 0.75*KL);
+            # Too many acceptances - decrease iterations but ensure minimum
+            KL = max(50, ceil(Int, 0.9*KL));
+        elseif (fraction_accepted < 0.2)
+            # Too few acceptances - increase iterations but cap maximum
+            KL = min(K, ceil(Int, 1.1*KL));
         end
 
-        # Case 2: not accepting many moves, so increase the number of iteratons
-        if (fraction_accepted < 0.2)
-            KL = ceil(Int, 1.5*KL);
+        # Adaptive cooling schedule based on constraint satisfaction
+        if best_ret_penalty > 1e-4  # If target return not met
+            T *= α^0.5  # Cool more slowly to explore more solutions
+            ρ *= 0.95  # Gradually increase penalty weight for constraints
+        else  # Good progress with return constraint
+            T *= α  # Standard cooling rate
+            ρ *= τ  # Standard penalty update
         end
-
-        # update penalty parameters and T -
-        μ *= τ*μ;
-        ρ *= τ*ρ;
-
-        if (T ≤ T₁)
-            has_converged = true;
-        else
-            T *= (α*T); # Not done yet, so decrease the T -
+        
+        # Multi-criteria convergence check
+        if T ≤ T₁ || (best_ret_penalty < 1e-4 && best_sum_penalty < 1e-4 && no_improvement_count > 5000)
+            # Check solution quality before accepting convergence
+            if best_ret_penalty < 1e-2 && best_sum_penalty < 1e-4  # Good solution found
+                has_converged = true
+            elseif T ≤ T₁/10  # Temperature very low but solution not ideal
+                has_converged = true  # Stop anyway to avoid wasting computation
+            end
         end
     end
 
